@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/log"
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -29,37 +29,61 @@ const MIME_TYPE_JPEG = "image/jpeg"
 const MIME_TYPE_PNG = "image/png"
 
 func main() {
-	err := godotenv.Load()
+	log.SetReportTimestamp(false)
+	godotenv.Load()
 	SGDB_API_KEY = os.Getenv("SGDB_API_KEY")
+	if SGDB_API_KEY == "" {
+		log.Fatal("Please set the SGDB_API_KEY environment variable with your StreamGridDB API key")
+	}
 
 	lutrisDirs, err := get_lutris_dir()
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatal("An error occurred while retrieving Lutris directories", "err", err)
 	}
 
 	db, err := connect_to_lutris_db(lutrisDirs.DbFilePath)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatal("An error occurred while connecting to Lutris database", "err", err)
 	}
 	defer db.Close()
 
 	slugs, err := select_game_slugs(db)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatal("An error occurred while fetching installed games", "err", err)
 	}
+	totalSlugs := len(slugs)
 	slugs = filter_game_slugs_with_missing_assets(lutrisDirs, slugs)
+	if len(slugs) == 0 {
+		log.Info(fmt.Sprintf("%d games found, none are missing assets!", totalSlugs))
+		os.Exit(0)
+	}
+	log.Info(fmt.Sprintf("%d games found, %d games are missing one or more assets", totalSlugs, len(slugs)))
 
 	for _, slug := range slugs {
 		id, err := fetch_steamgriddb_game_id(slug)
 		if err != nil {
+			log.Error("Error while retrieving SteamGridDB game ID", "game", slug, "err", err)
 			continue
 		}
 		grids, err := fetch_steamgriddb_grids(id)
 		if err != nil {
+			log.Error("Error while retrieving SteamGridDB grids", "game", slug, "err", err)
 			continue
 		}
-		download_asset_if_needed(lutrisDirs.CoverArtDirPath, slug, SGDB_COVER_WIDTH, grids)
-		download_asset_if_needed(lutrisDirs.BannersDirPath, slug, SGDB_BANNER_WIDTH, grids)
+		if assets_missing(lutrisDirs.CoverArtDirPath, slug) {
+			log.Info("Downloading cover...", "game", slug)
+			err = download_asset(lutrisDirs.CoverArtDirPath, slug, SGDB_COVER_WIDTH, grids)
+			if err != nil {
+				log.Error("Error while downloading cover", "game", slug, "err", err)
+			}
+		}
+		if assets_missing(lutrisDirs.BannersDirPath, slug) {
+			log.Info("Downloading banner...", "game", slug)
+			err = download_asset(lutrisDirs.BannersDirPath, slug, SGDB_BANNER_WIDTH, grids)
+			if err != nil {
+				log.Error("Error while downloading banner", "game", slug, "err", err)
+			}
+		}
 	}
 }
 
@@ -113,13 +137,13 @@ func filter_game_slugs_with_missing_assets(dirs lutrisDirs, slugs []string) []st
 }
 
 func assets_missing(assetDir, slug string) bool {
-	if _, err := os.Stat(filepath.Join(assetDir, fmt.Sprint(slug, ".jpg"))); err != nil {
-		return true
+	if _, err := os.Stat(filepath.Join(assetDir, fmt.Sprint(slug, ".jpg"))); err == nil {
+		return false
 	}
-	if _, err := os.Stat(filepath.Join(assetDir, fmt.Sprint(slug, ".png"))); err != nil {
-		return true
+	if _, err := os.Stat(filepath.Join(assetDir, fmt.Sprint(slug, ".png"))); err == nil {
+		return false
 	}
-	return false
+	return true
 }
 
 func fetch_steamgriddb_game_id(slug string) (int, error) {
@@ -168,6 +192,7 @@ func fetch_steamgriddb_grids(gameId int) ([]grid, error) {
 	u.Path = path.Join(u.Path, "grids/game", fmt.Sprint(gameId))
 	params := url.Values{}
 	params.Set("dimensions", strings.Join([]string{SGDB_COVER_FORMAT, SGDB_BANNER_FORMAT}, ","))
+	params.Set("nsfw", "any")
 	params.Set("types", "static")
 	u.RawQuery = params.Encode()
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
@@ -188,7 +213,7 @@ func fetch_steamgriddb_grids(gameId int) ([]grid, error) {
 		return []grid{}, err
 	}
 	if len(gridsResp.Grids) == 0 {
-		return []grid{}, errors.New("no grid found")
+		return []grid{}, errors.New("No grid yet available")
 	}
 	return gridsResp.Grids, nil
 }
@@ -204,10 +229,7 @@ type grid struct {
 	Height int    `json:"height"`
 }
 
-func download_asset_if_needed(assetDir, slug string, expectedWidth int, grids []grid) error {
-	if !assets_missing(assetDir, slug) {
-		return errors.New("asset already exists")
-	}
+func download_asset(assetDir, slug string, expectedWidth int, grids []grid) error {
 	var matching *grid
 	for _, grid := range grids {
 		if grid.Width == expectedWidth {
@@ -216,7 +238,7 @@ func download_asset_if_needed(assetDir, slug string, expectedWidth int, grids []
 		}
 	}
 	if matching == nil {
-		return errors.New("no grid found with the expected format")
+		return errors.New("No grid found with expected format")
 	}
 
 	var ext string
@@ -226,7 +248,7 @@ func download_asset_if_needed(assetDir, slug string, expectedWidth int, grids []
 	case MIME_TYPE_PNG:
 		ext = ".png"
 	default:
-		return errors.New("unexpected mime type")
+		return errors.New("Unexpected image mime type")
 	}
 	out, err := os.Create(filepath.Join(assetDir, fmt.Sprint(slug, ext)))
 	if err != nil {
